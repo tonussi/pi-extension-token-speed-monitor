@@ -1,0 +1,33 @@
+{
+  "name": "@tlabs/pi-extension-token-speed-monitor",
+  "version": "1.0.0",
+  "description": "Real-time tokens per second monitor for pi terminal UI",
+  "type": "module",
+  "main": "index.ts",
+  "author": "Extension",
+  "license": "MIT",
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.67.2",
+    "@mariozechner/pi-coding-agent": "^0.67.2",
+    "@mariozechner/pi-tui": "^0.67.2",
+    "@sinclair/typebox": "^0.34.49"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "test": "/tps"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/tonussi/pi-extension-token-speed-monitor.git"
+  },
+  "keywords": [
+    "pi",
+    "tps",
+    "tokens",
+    "monitor"
+  ],
+  "bugs": {
+    "url": "https://github.com/tonussi/pi-extension-token-speed-monitor/issues"
+  },
+  "homepage": "https://github.com/tonussi/pi-extension-token-speed-monitor#readme"
+}
