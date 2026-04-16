@@ -1,12 +1,23 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { AssistantMessageEvent } from "@mariozechner/pi-ai";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 interface TokenMetrics {
   startTime: number;
   tokenCount: number;
   lastUpdateTime: number;
   tps: number; // tokens per second (smoothed)
+  finalTPS: number; // final average when streaming ends
+  isStreaming: boolean;
+}
+
+interface SessionStats {
+  totalTokens: number;
+  totalTimeMs: number;
+  messageCount: number;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -14,6 +25,46 @@ export default function (pi: ExtensionAPI) {
   let currentMetrics: TokenMetrics | null = null;
   let renderRequested = false;
   let tuiRef: { requestRender(): void } | null = null;
+  let logInterval: NodeJS.Timeout | null = null;
+  let currentLogFile: string | null = null;
+  let currentModel: string = "no-model";
+  const LOG_INTERVAL_MS = 100; // 0.1 seconds for quicker refresh
+  const LOG_DIR = path.join(os.homedir(), "token-speed-monitor", "pi-logs");
+
+  function getLogFilePath(): string {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19); // YYYY-MM-DDTHH-MM-SS
+    return path.join(LOG_DIR, `tks-${timestamp}.log`);
+  }
+
+  function ensureLogDir(): void {
+    if (!fs.existsSync(LOG_DIR)) {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+    }
+  }
+
+  function rotateLogFile(): void {
+    ensureLogDir();
+    const newLogFile = getLogFilePath();
+    currentLogFile = newLogFile;
+    // Write header to new log file
+    fs.writeFileSync(currentLogFile, "datetime\ttps\tmodel\n"); // tab-separated header
+  }
+
+  function logMetrics(): void {
+    if (!currentMetrics || !enabled) return;
+    
+    // Rotate check: if current log doesn't exist (deleted) or we need to start fresh
+    if (!currentLogFile || !fs.existsSync(currentLogFile)) {
+      rotateLogFile();
+    }
+
+    const now = new Date();
+    const timestamp = now.toISOString();
+    const tps = currentMetrics.tps.toFixed(2);
+
+    const logLine = `${timestamp}\t${tps}\t${currentModel}\n`;
+    fs.appendFileSync(currentLogFile!, logLine);
+  }
 
   // Smoothing factor for TPS calculation (higher = more responsive but more jittery)
   const ALPHA = 0.3;
@@ -43,12 +94,28 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  let sessionStats: SessionStats = {
+    totalTokens: 0,
+    totalTimeMs: 0,
+    messageCount: 0,
+  };
+
   function resetMetrics() {
+    // Save previous session stats if we have completed metrics
+    if (currentMetrics && !currentMetrics.isStreaming && currentMetrics.finalTPS > 0) {
+      const elapsed = currentMetrics.lastUpdateTime - currentMetrics.startTime;
+      sessionStats.totalTokens += currentMetrics.tokenCount;
+      sessionStats.totalTimeMs += elapsed;
+      sessionStats.messageCount++;
+    }
+    
     currentMetrics = {
       startTime: Date.now(),
       tokenCount: 0,
       lastUpdateTime: Date.now(),
       tps: 0,
+      finalTPS: 0,
+      isStreaming: true,
     };
   }
 
@@ -78,18 +145,22 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Finalize on message complete
+  // Finalize on message complete - calculate final average TPS
   pi.on("message_end", async () => {
     if (currentMetrics) {
-      // Keep the last TPS value for a moment before clearing
-      setTimeout(() => {
-        if (!currentMetrics) return;
-        // Fade out after 5 seconds
-        setTimeout(() => {
-          currentMetrics = null;
-          if (tuiRef) tuiRef.requestRender();
-        }, 5000);
-      }, 100);
+      const elapsed = (currentMetrics.lastUpdateTime - currentMetrics.startTime) / 1000;
+      if (elapsed > 0) {
+        currentMetrics.finalTPS = currentMetrics.tokenCount / elapsed;
+      }
+      currentMetrics.isStreaming = false;
+      
+      // Update session stats
+      sessionStats.totalTokens += currentMetrics.tokenCount;
+      sessionStats.totalTimeMs += currentMetrics.lastUpdateTime - currentMetrics.startTime;
+      sessionStats.messageCount++;
+      
+      // Trigger render to show final stats
+      if (tuiRef) tuiRef.requestRender();
     }
   });
 
@@ -100,6 +171,22 @@ export default function (pi: ExtensionAPI) {
       enabled = !enabled;
 
       if (enabled) {
+        // Capture current model from context
+        currentModel = ctx.model?.id || "no-model";
+
+        // Start logging interval
+        rotateLogFile(); // Create initial log file
+        logInterval = setInterval(logMetrics, LOG_INTERVAL_MS);
+      } else {
+        // Stop logging interval
+        if (logInterval) {
+          clearInterval(logInterval);
+          logInterval = null;
+        }
+        currentLogFile = null;
+      }
+
+      if (enabled) {
         ctx.ui.setFooter((tui, theme, footerData) => {
           tuiRef = tui;
           const unsub = footerData.onBranchChange(() => tui.requestRender());
@@ -108,7 +195,6 @@ export default function (pi: ExtensionAPI) {
             dispose: () => {
               unsub();
               tuiRef = null;
-              currentMetrics = null;
             },
             invalidate() {},
             render(width: number): string[] {
@@ -128,12 +214,29 @@ export default function (pi: ExtensionAPI) {
               // Build left side with tokens stats + TPS
               let leftParts: string[] = [`↑${fmt(input)} ↓${fmt(output)}`];
               
-              if (currentMetrics && currentMetrics.tps > 0) {
-                const tpsStr = formatTPS(currentMetrics.tps);
-                const timeElapsed = ((currentMetrics.lastUpdateTime - currentMetrics.startTime) / 1000).toFixed(1);
-                leftParts.push(`⚡ ${tpsStr} t/s`);
-                leftParts.push(`⏱️ ${timeElapsed}s`);
-                leftParts.push(`📝 ~${currentMetrics.tokenCount}`);
+              if (currentMetrics) {
+                if (currentMetrics.isStreaming && currentMetrics.tps > 0) {
+                  // Show live metrics during streaming
+                  const tpsStr = formatTPS(currentMetrics.tps);
+                  const timeElapsed = ((currentMetrics.lastUpdateTime - currentMetrics.startTime) / 1000).toFixed(1);
+                  leftParts.push(`⚡ ${tpsStr} t/s`);
+                  leftParts.push(`⏱️ ${timeElapsed}s`);
+                  leftParts.push(`📝 ~${currentMetrics.tokenCount}`);
+                } else if (!currentMetrics.isStreaming && currentMetrics.finalTPS > 0) {
+                  // Show final average when not streaming
+                  const avgTPS = formatTPS(currentMetrics.finalTPS);
+                  const timeElapsed = ((currentMetrics.lastUpdateTime - currentMetrics.startTime) / 1000).toFixed(1);
+                  leftParts.push(`⌀ ${avgTPS} t/s`);
+                  leftParts.push(`⏱️ ${timeElapsed}s`);
+                  leftParts.push(`📝 ~${currentMetrics.tokenCount}`);
+                } else if (sessionStats.messageCount > 0) {
+                  // Show session average when no current metrics
+                  const sessionAvgTPS = sessionStats.totalTimeMs > 0 
+                    ? (sessionStats.totalTokens / (sessionStats.totalTimeMs / 1000)) 
+                    : 0;
+                  leftParts.push(`⌀ ${formatTPS(sessionAvgTPS)} t/s`);
+                  leftParts.push(`📊 ${sessionStats.messageCount}`);
+                }
               }
               
               const left = theme.fg("dim", leftParts.join(" "));
@@ -152,5 +255,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Default footer restored", "info");
       }
     },
+  });
+
+  // Cleanup on extension dispose
+  pi.on("cleanup", () => {
+    if (logInterval) {
+      clearInterval(logInterval);
+      logInterval = null;
+    }
   });
 }
